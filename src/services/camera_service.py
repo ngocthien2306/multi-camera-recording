@@ -151,7 +151,7 @@ class CameraManager:
                     frame = self.get_frame('EVS', camera_id)
                     if frame is not None:
                         # Create recording queue and stop event
-                        self.recording_queues[key] = Queue(maxsize=100)  # Allow up to 100 frames in buffer
+                        self.recording_queues[key] = Queue(maxsize=300)  # Allow up to 100 frames in buffer
                         self.recording_stop_events[key] = Event()
                         
                         # Start recorder process
@@ -292,6 +292,8 @@ class CameraManager:
         
         if on_complete_callback:
             on_complete_callback()
+    
+    
     
     def start_cameras_in_background(self, on_progress_callback=None, on_complete_callback=None):
         """Start camera processes in background thread"""

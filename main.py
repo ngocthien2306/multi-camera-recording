@@ -18,6 +18,7 @@ def ensure_mp_fork():
 
 
 def main():
+    ensure_mp_fork() 
     app = QApplication(sys.argv)
     window = CameraManagerApp()
     window.show()

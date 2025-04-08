@@ -17,6 +17,8 @@ except ImportError:
 
 def evs_camera_process(camera_id, device_path, frame_queue, command_event, status_value, device_info_queue=None, command_queue=None):
     """Process function for EVS camera processing"""
+    
+    
     if not METAVISION_AVAILABLE:
         print(f"Cannot initialize EVS camera {camera_id}: Metavision SDK not available")
         dummy_frame = np.zeros((480, 640), dtype=np.uint8)
