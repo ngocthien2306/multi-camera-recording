@@ -164,7 +164,30 @@ class CameraManagerApp(QMainWindow):
             total_cameras = len(evs_configs) + len(rgb_configs)
             
             if total_cameras > 0:
-                loading_dialog = LoadingDialog(total_cameras, self)
+                # Add and configure cameras first
+                self.display_area.clear_all_views()
+                
+                for camera_id, device_path in evs_configs:
+                    camera_key = self.camera_manager.add_evs_camera(camera_id, device_path)
+                    self.display_area.add_camera_view('EVS', camera_id)
+                
+                for camera_id, device_id in rgb_configs:
+                    camera_key = self.camera_manager.add_rgb_camera(camera_id, device_id)
+                    self.display_area.add_camera_view('RGB', camera_id)
+                
+                # Apply current scale
+                scale_factor = self.scale_slider.value() / 100.0
+                for key, camera_view in self.display_area.camera_views.items():
+                    camera_view.set_scale(scale_factor)
+                
+                # Create and show loading dialog
+                loading_dialog = LoadingDialog(total_cameras, self, self.camera_manager)
+                
+                # Show dialog, then start camera initialization in background
+                loading_dialog.show()
+                loading_dialog.start_camera_initialization()
+                
+                # Run dialog event loop
                 result = loading_dialog.exec_()
                 
                 if result == QDialog.Rejected:
@@ -173,41 +196,24 @@ class CameraManagerApp(QMainWindow):
                     self.control_panel.evs_count_spinbox.setEnabled(True)
                     self.control_panel.rgb_count_spinbox.setEnabled(True)
                     return
-            
-            self.display_area.clear_all_views()
-            
-            for camera_id, device_path in evs_configs:
-                camera_key = self.camera_manager.add_evs_camera(camera_id, device_path)
-                self.display_area.add_camera_view('EVS', camera_id)
-            
-            for camera_id, device_id in rgb_configs:
-                camera_key = self.camera_manager.add_rgb_camera(camera_id, device_id)
-                self.display_area.add_camera_view('RGB', camera_id)
-            
-            # Apply current scale
-            scale_factor = self.scale_slider.value() / 100.0
-            for key, camera_view in self.display_area.camera_views.items():
-                camera_view.set_scale(scale_factor)
-            
-            self.camera_manager.start_all_cameras()
-            
-            # Update recording button state if cameras are running
-            folder_path = self.control_panel.folder_path_label.text()
-            self.control_panel.start_recording_button.setEnabled(
-                folder_path != "Not selected"
-            )
-            
-            # Make sure scrollbar visibility is updated
-            self.on_scrollbar_toggle()
-        else:
-            # Cameras are not running, disable recording
-            self.control_panel.start_recording_button.setEnabled(False)
-            # If recording was in progress, stop it
-            if self.camera_manager.recording:
-                self.camera_manager.stop_recording()
-                self.control_panel.stop_recording_button.setEnabled(False)
-                self.control_panel.input_tag.setEnabled(True)
-    
+                
+                # Update recording button state if cameras are running
+                folder_path = self.control_panel.folder_path_label.text()
+                self.control_panel.start_recording_button.setEnabled(
+                    folder_path != "Not selected"
+                )
+                
+                # Make sure scrollbar visibility is updated
+                self.on_scrollbar_toggle()
+            else:
+                # Cameras are not running, disable recording
+                self.control_panel.start_recording_button.setEnabled(False)
+                # If recording was in progress, stop it
+                if self.camera_manager.recording:
+                    self.camera_manager.stop_recording()
+                    self.control_panel.stop_recording_button.setEnabled(False)
+                    self.control_panel.input_tag.setEnabled(True)
+                
     def closeEvent(self, event):
         """Handle window close event"""
         # Clean up camera resources

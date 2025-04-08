@@ -1,6 +1,7 @@
 
 import os
 from multiprocessing import Process, Queue, Event, Value
+import threading
 import time
 
 from src.utils.process_module import evs_camera_process, frame_recorder_process, rgb_camera_process
@@ -262,18 +263,45 @@ class CameraManager:
             del self.frame_queues[key]
             del self.command_events[key]
             del self.status_values[key]
-    
-    def start_all_cameras(self):
-        """Start all camera processes"""
+
+    def start_all_cameras(self, on_progress_callback=None, on_complete_callback=None):
+        """Start all camera processes with progress tracking capability"""
+        total_cameras = len(self.evs_cameras) + len(self.rgb_cameras)
+        started_cameras = 0
+        
+        # Start EVS cameras
         for camera_id, process in self.evs_cameras.items():
             if not process.is_alive():
                 process.start()
+                time.sleep(5)  # Still keep sleep but now it won't block the UI
+                started_cameras += 1
                 
-                time.sleep(5)
-                
+                if on_progress_callback:
+                    progress = (started_cameras / total_cameras) * 100
+                    on_progress_callback(progress, f"Starting EVS camera {camera_id}")
+        
+        # Start RGB cameras            
         for camera_id, process in self.rgb_cameras.items():
             if not process.is_alive():
                 process.start()
+                started_cameras += 1
+                
+                if on_progress_callback:
+                    progress = (started_cameras / total_cameras) * 100
+                    on_progress_callback(progress, f"Starting RGB camera {camera_id}")
+        
+        if on_complete_callback:
+            on_complete_callback()
+    
+    def start_cameras_in_background(self, on_progress_callback=None, on_complete_callback=None):
+        """Start camera processes in background thread"""
+        camera_thread = threading.Thread(
+            target=self.start_all_cameras,
+            args=(on_progress_callback, on_complete_callback)
+        )
+        camera_thread.daemon = True  # Make thread exit when main thread exits
+        camera_thread.start()
+        return camera_thread
     
     def stop_all_cameras(self):
         """Stop all camera processes"""

@@ -1,55 +1,22 @@
-import sys
-import time
 from PyQt5.QtWidgets import (QDialog, QProgressBar, QLabel, QVBoxLayout,
-                           QHBoxLayout, QPushButton, QApplication)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-
-class CameraInitThread(QThread):
-    progress_updated = pyqtSignal(int)
-    initialization_complete = pyqtSignal()
-    
-    def __init__(self, camera_count):
-        super().__init__()
-        self.camera_count = camera_count
-        self.is_cancelled = False
-    
-    def run(self):
-        for i in range(self.camera_count):
-            if self.is_cancelled:
-                break
-                
-            for j in range(100):
-                if self.is_cancelled:
-                    break
-                
-                progress = int((i * 100 + j) / (self.camera_count * 100) * 100)
-                self.progress_updated.emit(progress)
-                time.sleep(0.05)
-        
-        if not self.is_cancelled:
-            self.initialization_complete.emit()
-    
-    def cancel(self):
-        self.is_cancelled = True
-
+                           QHBoxLayout, QPushButton)
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer
 
 class LoadingDialog(QDialog):
-    def __init__(self, camera_count, parent=None):
+    initialization_complete = pyqtSignal()
+    
+    def __init__(self, camera_count, parent=None, camera_manager=None):
         super().__init__(parent, Qt.Window)
         self.camera_count = camera_count
         self.total_time = camera_count * 5 
         self.remaining_time = self.total_time
+        self.camera_manager = camera_manager
         self.init_ui()
-        
-        self.init_thread = CameraInitThread(camera_count)
-        self.init_thread.progress_updated.connect(self.update_progress)
-        self.init_thread.initialization_complete.connect(self.on_initialization_complete)
         
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.update_remaining_time)
         self.timer.start(1000)  
         
-        self.init_thread.start()
     
     def init_ui(self):
         self.setWindowTitle("Initializing Cameras")
@@ -105,10 +72,25 @@ class LoadingDialog(QDialog):
         layout.addLayout(button_layout)
         
         self.setLayout(layout)
+        
+        # Track cancellation
+        self.cancelled = False
     
-    def update_progress(self, value):
+    def start_camera_initialization(self):
+        """Start camera initialization in background"""
+        if self.camera_manager:
+            self.camera_thread = self.camera_manager.start_cameras_in_background(
+                on_progress_callback=self.update_progress,
+                on_complete_callback=self.on_initialization_complete
+            )
+    
+    def update_progress(self, value, message=None):
+        """Update progress bar with value from camera initialization"""
         self.progress_bar.setValue(value)
         
+        if message:
+            self.info_label.setText(message)
+            
         remaining = (100 - value) * self.total_time / 100
         self.remaining_time = max(1, int(remaining))
         self.time_label.setText(f"Remaining time: {self.remaining_time} seconds")
@@ -119,12 +101,13 @@ class LoadingDialog(QDialog):
             self.time_label.setText(f"Remaining time: {self.remaining_time} seconds")
     
     def on_initialization_complete(self):
+        """Called when camera initialization is complete"""
         self.timer.stop()
         self.accept()
     
     def cancel_initialization(self):
-        self.init_thread.cancel()
-        self.init_thread.wait()
+        """Cancel the initialization process"""
+        self.cancelled = True
         self.timer.stop()
         self.reject()
     
