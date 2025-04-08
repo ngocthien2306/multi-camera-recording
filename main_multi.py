@@ -1,17 +1,20 @@
+import queue
 import sys
 import cv2
 import numpy as np
 import time
 import os
-import signal
+import json
 import multiprocessing as mp
 from multiprocessing import Process, Queue, Event, Value
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                             QLabel, QPushButton, QComboBox, QGroupBox, QGridLayout, 
                             QSpinBox, QSplitter, QFrame, QCheckBox, QSizePolicy,
-                            QScrollArea, QSlider, QFileDialog, QLineEdit)
+                            QScrollArea, QSlider, QFileDialog, QLineEdit, QMessageBox)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot, QSize
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QColor, QFont
+from bias import BiasValue, BiasSettings, BiasControlWidget
+
 try:
     from metavision_core.event_io.raw_reader import initiate_device
     from metavision_core.event_io import EventsIterator, LiveReplayEventsIterator, is_live_camera
@@ -21,10 +24,405 @@ except ImportError:
     METAVISION_AVAILABLE = False
     print("Metavision SDK not available. Only RGB cameras are supported.")
 
+
+
+class BiasInfo:
+    """Stores information about a specific bias"""
+    def __init__(self, name, value, min_val, max_val, description="", modifiable=True):
+        self.name = name
+        self.value = value
+        self.min_val = min_val
+        self.max_val = max_val
+        self.description = description
+        self.modifiable = modifiable
+        
+class CameraSensorType:
+    """Enum for EVS camera types"""
+    UNKNOWN = "Unknown"
+    GEN3 = "Gen3"
+    GEN31 = "Gen3.1"
+    GEN4 = "Gen4"
+    GEN41 = "Gen4.1"
+    IMX636 = "IMX636"
+    GENX320 = "GenX320"
+
+class CameraBiasManager:
+    """Class to manage biases based on camera type"""
+    
+    @staticmethod
+    def detect_camera_model(device):
+        """Determine camera type from device"""
+        try:
+            # Get hardware identification information
+            hw_id = device.get_i_hw_identification()
+            if hw_id:
+                # Get sensor information
+                sensor_info = hw_id.get_sensor_info()
+                if sensor_info:
+                    # Identify sensor type based on version and name
+                    if "IMX636" in sensor_info.name:
+                        return CameraSensorType.IMX636
+                    elif "GenX320" in sensor_info.name:
+                        return CameraSensorType.GENX320
+                    elif sensor_info.major_version == 3:
+                        if sensor_info.minor_version == 1:
+                            return CameraSensorType.GEN31
+                        else:
+                            return CameraSensorType.GEN3
+                    elif sensor_info.major_version == 4:
+                        if sensor_info.minor_version == 1:
+                            return CameraSensorType.GEN41
+                        else:
+                            return CameraSensorType.GEN4
+            
+            # If unable to determine from HW info, try to identify from biases
+            biases = device.get_i_ll_biases()
+            if biases:
+                all_biases = biases.get_all_biases()
+                
+                # Identify camera type from bias_diff
+                if "bias_diff" in all_biases:
+                    bias_diff = all_biases["bias_diff"]
+                    if bias_diff == 299 or (250 < bias_diff < 350):
+                        return CameraSensorType.GEN31
+                    elif bias_diff == 80 or (50 < bias_diff < 100):
+                        return CameraSensorType.GEN41
+                    elif bias_diff == 0 or (-25 <= bias_diff <= 23):
+                        return CameraSensorType.IMX636
+                    elif bias_diff == 51 or (41 <= bias_diff <= 51):
+                        return CameraSensorType.GENX320
+            
+            # If unable to determine from biases, try to identify from dimensions
+            geometry = device.get_i_geometry()
+            if geometry:
+                width = geometry.get_width()
+                height = geometry.get_height()
+                
+                if width == 1280 and height == 720:
+                    return CameraSensorType.IMX636
+                elif width == 320 and height == 320:
+                    return CameraSensorType.GENX320
+                elif width == 640 and height == 480:
+                    # Cannot precisely distinguish Gen3 vs Gen4 from dimensions alone
+                    return CameraSensorType.GEN4  # Default to Gen4
+                    
+        except Exception as e:
+            print(f"Error determining camera type: {e}")
+        
+        return CameraSensorType.UNKNOWN
+    
+    @staticmethod
+    def get_bias_limits(camera_type):
+        """
+        Returns default bias limits for each camera type
+        Returns a dict with bias name as key and value as tuple (default_value, min, max, description)
+        """
+        # Bias limits for Gen3.1
+        if camera_type == CameraSensorType.GEN31:
+            return {
+                "bias_diff": (299, 200, 400, "Bias differential reference"),
+                "bias_diff_on": (384, 374, 499, "ON events contrast threshold"),
+                "bias_diff_off": (222, 100, 234, "OFF events contrast threshold"),
+                "bias_fo": (1477, 1250, 1800, "Low-pass filter bandwidth"),
+                "bias_hpf": (1499, 900, 1800, "High-pass filter bandwidth"),
+                "bias_refr": (1500, 1300, 1800, "Refractory period")
+            }
+        
+        # Bias limits for Gen4.1
+        elif camera_type == CameraSensorType.GEN41:
+            return {
+                "bias_diff": (80, 52, 100, "Bias differential reference"),
+                "bias_diff_on": (115, 95, 140, "ON events contrast threshold"),
+                "bias_diff_off": (52, 25, 65, "OFF events contrast threshold"),
+                "bias_fo": (74, 45, 110, "Low-pass filter bandwidth"),
+                "bias_hpf": (0, 0, 120, "High-pass filter bandwidth"),
+                "bias_refr": (68, 30, 100, "Refractory period")
+            }
+        
+        # Bias limits for IMX636
+        elif camera_type == CameraSensorType.IMX636:
+            return {
+                "bias_diff": (0, -25, 23, "Bias differential reference"),
+                "bias_diff_on": (0, -85, 140, "ON events contrast threshold"),
+                "bias_diff_off": (0, -35, 190, "OFF events contrast threshold"),
+                "bias_fo": (0, -35, 55, "Low-pass filter bandwidth"),
+                "bias_hpf": (0, 0, 120, "High-pass filter bandwidth"),
+                "bias_refr": (0, -20, 235, "Refractory period")
+            }
+        
+        # Bias limits for GenX320
+        elif camera_type == CameraSensorType.GENX320:
+            return {
+                "bias_diff": (51, 41, 51, "Bias differential reference"),
+                "bias_diff_on": (25, 24, 60, "ON events contrast threshold"),
+                "bias_diff_off": (28, 19, 50, "OFF events contrast threshold"),
+                "bias_fo": (34, 19, 39, "Low-pass filter bandwidth"),
+                "bias_hpf": (40, 0, 127, "High-pass filter bandwidth"),
+                "bias_refr": (10, 0, 127, "Refractory period")
+            }
+        
+        # Default values for Gen3/Gen4 or unidentified
+        else:
+            return {
+                "bias_diff": (0, -25, 23, "Bias differential reference"),
+                "bias_diff_on": (0, -85, 140, "ON events contrast threshold"),
+                "bias_diff_off": (0, -35, 190, "OFF events contrast threshold"),
+                "bias_fo": (0, -35, 55, "Low-pass filter bandwidth"),
+                "bias_hpf": (0, 0, 120, "High-pass filter bandwidth"),
+                "bias_refr": (0, -20, 235, "Refractory period")
+            }
+    
+    @staticmethod
+    def get_biases_from_device(device):
+        """Get bias information from camera device"""
+        biases_info = {}
+        
+        try:
+            biases_facility = device.get_i_ll_biases()
+            if biases_facility:
+                all_biases = biases_facility.get_all_biases()
+                
+                # Get detailed information for each bias
+                for bias_name, bias_value in all_biases.items():
+                    try:
+                        bias_info = biases_facility.get_bias_info(bias_name)
+                        min_val, max_val = bias_info.get_bias_range()
+                        description = bias_info.get_description()
+                        modifiable = bias_info.is_modifiable()
+                        
+                        biases_info[bias_name] = BiasInfo(
+                            bias_name, bias_value, min_val, max_val, 
+                            description, modifiable
+                        )
+                    except Exception as e:
+                        print(f"Error getting detailed information for bias {bias_name}: {e}")
+        except Exception as e:
+            print(f"Error getting bias information from device: {e}")
+            
+        return biases_info
+
+class BiasSlider(QWidget):
+    """Widget displaying a bias adjustment slider with label and value"""
+    bias_changed = pyqtSignal(str, int)  # Bias name, new value
+    
+    def __init__(self, bias_info, parent=None):
+        super().__init__(parent)
+        self.bias_info = bias_info
+        self.setup_ui()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Title and description
+        title_layout = QHBoxLayout()
+        name_label = QLabel(f"<b>{self.bias_info.name}</b>")
+        title_layout.addWidget(name_label)
+        title_layout.addStretch()
+        
+        # Display value
+        self.value_label = QLabel(f"{self.bias_info.value}")
+        self.value_label.setAlignment(Qt.AlignRight)
+        title_layout.addWidget(self.value_label)
+        
+        layout.addLayout(title_layout)
+        
+        # Description
+        if self.bias_info.description:
+            desc_label = QLabel(self.bias_info.description)
+            desc_label.setStyleSheet("color: #AAAAAA; font-size: 11px;")
+            desc_label.setWordWrap(True)
+            layout.addWidget(desc_label)
+        
+        # Slider or SpinBox
+        slider_layout = QHBoxLayout()
+        
+        # Display minimum value
+        min_label = QLabel(f"{self.bias_info.min_val}")
+        min_label.setAlignment(Qt.AlignLeft)
+        slider_layout.addWidget(min_label)
+        
+        # SpinBox for direct input
+        self.spin_box = QSpinBox()
+        self.spin_box.setRange(self.bias_info.min_val, self.bias_info.max_val)
+        self.spin_box.setValue(self.bias_info.value)
+        self.spin_box.valueChanged.connect(self.on_value_changed)
+        self.spin_box.setEnabled(self.bias_info.modifiable)
+        
+        # Slider
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(self.bias_info.min_val, self.bias_info.max_val)
+        self.slider.setValue(self.bias_info.value)
+        self.slider.valueChanged.connect(self.on_slider_changed)
+        self.slider.setEnabled(self.bias_info.modifiable)
+        
+        slider_layout.addWidget(self.slider)
+        
+        # Display maximum value
+        max_label = QLabel(f"{self.bias_info.max_val}")
+        max_label.setAlignment(Qt.AlignRight)
+        slider_layout.addWidget(max_label)
+        
+        # Add SpinBox on the right
+        slider_layout.addWidget(self.spin_box)
+        
+        layout.addLayout(slider_layout)
+        
+        # Disable if not modifiable
+        if not self.bias_info.modifiable:
+            self.setEnabled(False)
+    
+    def on_slider_changed(self, value):
+        """Handle slider value change"""
+        self.spin_box.setValue(value)
+        self.value_label.setText(f"{value}")
+        self.bias_changed.emit(self.bias_info.name, value)
+    
+    def on_value_changed(self, value):
+        """Handle direct value input change"""
+        self.slider.setValue(value)
+        self.value_label.setText(f"{value}")
+        self.bias_changed.emit(self.bias_info.name, value)
+    
+    def get_bias_value(self):
+        """Get current bias value"""
+        return self.slider.value()
+    
+class EnhancedBiasControlWidget(QWidget):
+    """Bias control widget with automatic camera type detection"""
+    bias_changed = pyqtSignal(str, int)  # Bias name, new value
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.camera_type = CameraSensorType.UNKNOWN
+        self.bias_sliders = {}
+        self.init_ui()
+    
+    def init_ui(self):
+        main_layout = QVBoxLayout(self)
+        
+        # Camera information
+        info_group = QGroupBox("Camera Information")
+        info_layout = QVBoxLayout()
+        
+        self.camera_type_label = QLabel("Camera type: Unidentified")
+        self.camera_resolution_label = QLabel("Resolution: Unidentified")
+        
+        info_layout.addWidget(self.camera_type_label)
+        info_layout.addWidget(self.camera_resolution_label)
+        
+        info_group.setLayout(info_layout)
+        main_layout.addWidget(info_group)
+        
+        # Create scroll area for biases
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        
+        self.bias_widget = QWidget()
+        self.bias_layout = QVBoxLayout(self.bias_widget)
+        
+        scroll_area.setWidget(self.bias_widget)
+        main_layout.addWidget(scroll_area)
+        
+        # Control buttons
+        button_layout = QHBoxLayout()
+        
+        # Default values button
+        self.default_button = QPushButton("Set Default Values")
+        self.default_button.clicked.connect(self.reset_to_defaults)
+        button_layout.addWidget(self.default_button)
+        
+        # Apply button
+        self.apply_button = QPushButton("Apply")
+        self.apply_button.clicked.connect(self.apply_all_biases)
+        button_layout.addWidget(self.apply_button)
+        
+        main_layout.addLayout(button_layout)
+    
+    def setup_from_info(self, device_info):
+        """Setup UI based on device information dictionary"""
+        # Clear current biases
+        while self.bias_layout.count():
+            item = self.bias_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        
+        self.bias_sliders.clear()
+        
+        # Get camera type and resolution from info
+        self.camera_type = device_info.get('camera_type', CameraSensorType.UNKNOWN)
+        resolution = device_info.get('resolution', (0, 0))
+        
+        # Update camera information
+        self.camera_type_label.setText(f"Camera type: {self.camera_type}")
+        self.camera_resolution_label.setText(f"Resolution: {resolution[0]}x{resolution[1]}")
+        
+        # Get bias information
+        biases_info = device_info.get('biases', {})
+        
+        # Create control UI for each bias
+        for bias_name, bias_info in biases_info.items():
+            # Only display adjustable biases or important biases
+            important_biases = ["bias_diff", "bias_diff_on", "bias_diff_off", 
+                                "bias_fo", "bias_hpf", "bias_refr"]
+                               
+            if bias_info.modifiable or bias_name in important_biases:
+                bias_slider = BiasSlider(bias_info)
+                bias_slider.bias_changed.connect(self.on_bias_changed)
+                self.bias_layout.addWidget(bias_slider)
+                self.bias_sliders[bias_name] = bias_slider
+                
+                # Add separator between biases
+                if bias_name != list(biases_info.keys())[-1]:
+                    line = QFrame()
+                    line.setFrameShape(QFrame.HLine)
+                    line.setFrameShadow(QFrame.Sunken)
+                    line.setStyleSheet("background-color: #3F3F46;")
+                    self.bias_layout.addWidget(line)
+    
+
+    def on_bias_changed(self, bias_name, value):
+        """Handle bias value change - emit signal immediately"""
+        # Forward the signal to parent without waiting for "Apply"
+        self.bias_changed.emit(bias_name, value)
+        
+    def apply_bias_settings(self, bias_settings):
+        """Apply loaded bias settings to bias sliders"""
+        for bias_name, value in bias_settings.items():
+            if bias_name in self.bias_sliders:
+                self.bias_sliders[bias_name].slider.setValue(value)
+        
+        # Optional: Apply all biases immediately
+        self.apply_all_biases()
+
+    def get_bias_settings(self):
+        """Get current bias settings from sliders"""
+        bias_settings = {}
+        for bias_name, bias_slider in self.bias_sliders.items():
+            bias_settings[bias_name] = bias_slider.get_bias_value()
+        return bias_settings
+        
+    def reset_to_defaults(self):
+        """Reset all biases to default values"""
+        default_values = CameraBiasManager.get_bias_limits(self.camera_type)
+        
+        for bias_name, bias_slider in self.bias_sliders.items():
+            if bias_name in default_values:
+                default_value = default_values[bias_name][0]  # Get default value
+                bias_slider.slider.setValue(default_value)
+    
+    def apply_all_biases(self):
+        """Apply all bias changes"""
+        # Send signal for all current biases
+        for bias_name, bias_slider in self.bias_sliders.items():
+            value = bias_slider.get_bias_value()
+            self.bias_changed.emit(bias_name, value)
+            
 # Global variables for IPC
 MAX_QUEUE_SIZE = 10  # Maximum frames to queue per camera
 
-def evs_camera_process(camera_id, device_path, frame_queue, command_event, status_value, command_queue=None):
+def evs_camera_process(camera_id, device_path, frame_queue, command_event, status_value, device_info_queue=None, command_queue=None):
     """Process function for EVS camera processing"""
     if not METAVISION_AVAILABLE:
         print(f"Cannot initialize EVS camera {camera_id}: Metavision SDK not available")
@@ -37,7 +435,23 @@ def evs_camera_process(camera_id, device_path, frame_queue, command_event, statu
         print(f"Opening EVS camera {camera_id}: '{device_path}'")
         status_value.value = 1  # Mark as running
         device = initiate_device("", do_time_shifting=False)
-        # Create events iterator
+        
+        # Send camera model information through Queue if available
+        if device_info_queue:
+            # Detect camera type
+            camera_type = CameraBiasManager.detect_camera_model(device)
+            biases_info = CameraBiasManager.get_biases_from_device(device)
+            geometry = device.get_i_geometry()
+            width = geometry.get_width() if geometry else 0
+            height = geometry.get_height() if geometry else 0
+            
+            # Send information to main process
+            device_info_queue.put({
+                'camera_id': camera_id,
+                'camera_type': camera_type,
+                'resolution': (width, height),
+                'biases': biases_info
+            })
         
         mv_iterator = EventsIterator.from_device(device, start_ts=0, delta_t=1000)
         
@@ -82,6 +496,17 @@ def evs_camera_process(camera_id, device_path, frame_queue, command_event, statu
                     device.get_i_events_stream().stop_log_raw_data()
                     print(f"EVS camera {camera_id} stopped raw recording")
                     
+                elif cmd == 'update_bias':
+                    # Update bias settings
+                    bias_name, value = arg
+                    try:
+                        biases = device.get_i_ll_biases()
+                        if biases is not None:
+                            biases.set(bias_name, value)
+                            print(f"EVS camera {camera_id} updated bias {bias_name} = {value}")
+                    except Exception as e:
+                        print(f"Error updating bias for camera {camera_id}: {e}")
+                                    
             # Process events from camera
             event_frame_gen.process_events(evs)
             
@@ -105,8 +530,8 @@ def rgb_camera_process(camera_id, device_id, frame_queue, command_event, status_
             raise Exception(f"Cannot open RGB camera with device ID {device_id}")
         
         # Set camera properties
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         
         # Mark process as running
         status_value.value = 1
@@ -122,7 +547,7 @@ def rgb_camera_process(camera_id, device_id, frame_queue, command_event, status_
                     frame_queue.put((camera_id, frame.copy()))
             else:
                 # Send a dummy frame on error
-                dummy_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                dummy_frame = np.zeros((1280, 720, 3), dtype=np.uint8)
                 if not frame_queue.full():
                     frame_queue.put((camera_id, dummy_frame))
                 print(f"Error reading frame from RGB camera {camera_id}")
@@ -141,6 +566,199 @@ def rgb_camera_process(camera_id, device_id, frame_queue, command_event, status_
         status_value.value = 0  # Mark as stopped
         print(f"RGB camera {camera_id} process stopped")
 
+def frame_recorder_process(camera_key, file_path, frame_queue, stop_event, frame_shape, fps, is_grayscale):
+    """Process function for recording frames to video file"""
+    try:
+        print(f"Starting recorder process for {camera_key} to {file_path}")
+        
+        # Determine video parameters
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        
+        if len(frame_shape) == 2:  # Grayscale
+            height, width = frame_shape
+            is_color = False
+        else:  # RGB
+            height, width, _ = frame_shape
+            is_color = True
+        
+        # Create video writer
+        writer = cv2.VideoWriter(file_path, fourcc, fps, (width, height), is_color)
+        
+        if not writer.isOpened():
+            raise Exception(f"Failed to open video writer for {file_path}")
+        
+        frame_count = 0
+        last_time = time.time()
+        actual_fps = 0
+        
+        # Process frames until stop signal
+        while not stop_event.is_set() or not frame_queue.empty():
+            try:
+                # Use a timeout to check for stop_event periodically
+                frame = frame_queue.get(timeout=0.1)
+                
+                # Write frame
+                writer.write(frame)
+                frame_count += 1
+                
+                # Calculate actual FPS for logging
+                if frame_count % 30 == 0:
+                    current_time = time.time()
+                    time_diff = current_time - last_time
+                    if time_diff > 0:
+                        actual_fps = 30 / time_diff
+                        print(f"Recording {camera_key} at {actual_fps:.1f} FPS, queue size: {frame_queue.qsize()}")
+                    last_time = current_time
+                    
+            except queue.Empty:
+                # No frame available, just continue and check stop_event
+                pass
+                
+    except Exception as e:
+        print(f"Error in recorder process for {camera_key}: {e}")
+    finally:
+        # Make sure to close the writer
+        if 'writer' in locals():
+            writer.release()
+            print(f"Recorder for {camera_key} stopped after writing {frame_count} frames")
+
+
+class BiasSettingsDialog(QWidget):
+    bias_changed = pyqtSignal(str, int, int)  # Bias name, new value, camera ID
+    
+    def __init__(self, camera_id, device_info=None, parent=None):
+        super().__init__(parent, Qt.Window)
+        self.camera_id = camera_id
+        self.device_info = device_info
+        self.setWindowTitle(f"EVS Camera {camera_id} Bias Settings")
+        self.setGeometry(100, 100, 500, 600)
+        self.setup_ui()
+       
+    def add_load_save_buttons(self):
+        """Add load and save buttons to the bias settings dialog"""
+        # Create buttons layout (to be added to the main layout)
+        buttons_layout = QHBoxLayout()
+        
+        # Add Load button
+        self.load_button = QPushButton("Load Bias")
+        self.load_button.clicked.connect(self.load_bias_settings)
+        buttons_layout.addWidget(self.load_button)
+        
+        # Add Save button
+        self.save_button = QPushButton("Save Bias")
+        self.save_button.clicked.connect(self.save_bias_settings)
+        buttons_layout.addWidget(self.save_button)
+        
+        # Return the layout to be added to main layout
+        return buttons_layout
+
+    def load_bias_settings(self):
+        """Load bias settings from a file"""
+        # Ensure biases directory exists
+        biases_dir = self.ensure_biases_dir()
+        
+        # Default filename based on camera type
+        default_filename = f"{self.get_camera_type()}_bias_settings.json"
+        default_path = os.path.join(biases_dir, default_filename)
+        
+        # Open file dialog
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Load Bias Settings", 
+            default_path,
+            "JSON Files (*.json)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            # Load JSON file
+            with open(file_path, 'r') as f:
+                bias_settings = json.load(f)
+            
+            # Apply settings to bias controls
+            self.bias_widget.apply_bias_settings(bias_settings)
+            
+            QMessageBox.information(self, "Load Successful", 
+                                f"Bias settings loaded from {os.path.basename(file_path)}")
+        except Exception as e:
+            QMessageBox.warning(self, "Load Error", 
+                            f"Failed to load bias settings: {str(e)}")
+
+    def save_bias_settings(self):
+        """Save bias settings to a file"""
+        # Ensure biases directory exists
+        biases_dir = self.ensure_biases_dir()
+        
+        # Default filename based on camera type
+        default_filename = f"{self.get_camera_type()}_bias_settings.json"
+        default_path = os.path.join(biases_dir, default_filename)
+        
+        # Open file dialog
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Bias Settings", 
+            default_path,
+            "JSON Files (*.json)"
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            # Get current bias settings
+            bias_settings = self.bias_widget.get_bias_settings()
+            
+            # Save to JSON file
+            with open(file_path, 'w') as f:
+                json.dump(bias_settings, f, indent=4)
+            
+            QMessageBox.information(self, "Save Successful", 
+                                f"Bias settings saved to {os.path.basename(file_path)}")
+        except Exception as e:
+            QMessageBox.warning(self, "Save Error", 
+                            f"Failed to save bias settings: {str(e)}")
+
+    def ensure_biases_dir(self):
+        """Ensure biases directory exists and return path"""
+        biases_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'biases')
+        if not os.path.exists(biases_dir):
+            os.makedirs(biases_dir)
+        return biases_dir
+
+    def get_camera_type(self):
+        """Get camera type string for filename"""
+        if self.device_info and 'camera_type' in self.device_info:
+            return self.device_info['camera_type']
+        return "Unknown"
+     
+    def setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        
+        # Add Enhanced Bias Control Widget
+        self.bias_widget = EnhancedBiasControlWidget()
+        self.bias_widget.bias_changed.connect(self.on_bias_changed)
+        main_layout.addWidget(self.bias_widget)
+        
+        # Setup UI with device info
+        if self.device_info:
+            self.bias_widget.setup_from_info(self.device_info)
+        
+        # Add load/save buttons
+        load_save_layout = self.add_load_save_buttons()
+        main_layout.addLayout(load_save_layout)
+        
+        # Add close button
+        button_layout = QHBoxLayout()
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.close)
+        button_layout.addStretch()
+        button_layout.addWidget(close_button)
+        main_layout.addLayout(button_layout)
+    
+    def on_bias_changed(self, bias_name, value):
+        # Forward signal with camera ID
+        self.bias_changed.emit(bias_name, value, self.camera_id)
+        
 class CameraView(QLabel):
     """Widget to display camera feed with scaling options"""
     def __init__(self, camera_id, camera_type):
@@ -275,7 +893,7 @@ class CameraManager:
         self.command_events = {}  # Dictionary of command events by (type, ID)
         self.status_values = {}  # Dictionary of status values by (type, ID)
         self.command_queue = {}
-        
+        self.device_info_queues = {}  # Add this line to initialize the dict
         
         self.recording = False
         self.recording_path = ""
@@ -291,6 +909,7 @@ class CameraManager:
         frame_queue = Queue(maxsize=MAX_QUEUE_SIZE)
         command_event = Event()
         status_value = Value('i', 0)  # 0=stopped, 1=running
+        device_info_queue = Queue()  # Queue to receive device information
         
         if 'command_queue' not in self.__dict__:
             self.command_queue = {}
@@ -301,10 +920,12 @@ class CameraManager:
         self.frame_queues[key] = frame_queue
         self.command_events[key] = command_event
         self.status_values[key] = status_value
+        self.device_info_queues[key] = device_info_queue
         
         process = Process(
             target=evs_camera_process,
-            args=(camera_id, device_path, frame_queue, command_event, status_value, self.command_queue[key])
+            args=(camera_id, device_path, frame_queue, command_event, 
+                status_value, device_info_queue, self.command_queue[key])
         )
         
         self.evs_cameras[camera_id] = process
@@ -335,6 +956,12 @@ class CameraManager:
         self.rgb_cameras[camera_id] = process
         return key
     
+    def update_camera_bias(self, bias_name, value, camera_id):
+        """Send bias update command to specific EVS camera"""
+        key = ('EVS', camera_id)
+        if key in self.command_queue:
+            self.command_queue[key].put(('update_bias', (bias_name, value)))
+        
     def remove_evs_camera(self, camera_id):
         """Remove an EVS camera"""
         key = ('EVS', camera_id)
@@ -358,9 +985,10 @@ class CameraManager:
             del self.command_events[key]
             del self.status_values[key]
             
-            
+    
+    
     def start_recording(self, folder_path, tag=""):
-        """Start recording from all active cameras"""
+        """Start recording from all active cameras with dedicated recording queues"""
         if self.recording:
             return False
         
@@ -370,68 +998,70 @@ class CameraManager:
         self.recording_tag = tag
         
         try:
+            # Initialize recording queues and worker processes
+            self.recording_queues = {}
+            self.recording_processes = {}
+            self.recording_stop_events = {}
+            
             # Create camera-specific subfolders if they don't exist
             for camera_type in ['EVS', 'RGB']:
                 camera_dir = os.path.join(folder_path, camera_type)
                 if not os.path.exists(camera_dir):
                     os.makedirs(camera_dir)
             
-            # Initialize video writers for all active cameras
-            for camera_type, cameras in [('EVS', self.evs_cameras), ('RGB', self.rgb_cameras)]:
-                for camera_id in cameras.keys():
-                    key = (camera_type, camera_id)
+            # For EVS cameras, start raw recording
+            for camera_id in self.evs_cameras.keys():
+                key = ('EVS', camera_id)
+                
+                if self.status_values[key].value == 1:  # Only record running cameras
+                    # Start raw recording via command queue
+                    raw_filepath = os.path.join(folder_path, 'EVS', f"EVS_{camera_id}_{tag}_{timestamp}.raw")
+                    if key not in self.command_queue:
+                        self.command_queue[key] = Queue()
+                    self.command_queue[key].put(('start_recording', raw_filepath))
                     
-                    if self.status_values[key].value == 1:  # Only record running cameras
-                        # Determine output file name with tag
-                        file_name = f"{camera_type}_{camera_id}_{tag}_{timestamp}.avi"
-                        file_path = os.path.join(folder_path, camera_type, file_name)
+                    # Setup a dedicated recording queue for video frames
+                    video_filepath = os.path.join(folder_path, 'EVS', f"EVS_{camera_id}_{tag}_{timestamp}.avi")
+                    
+                    # Get a frame to determine dimensions for video writer
+                    frame = self.get_frame('EVS', camera_id)
+                    if frame is not None:
+                        # Create recording queue and stop event
+                        self.recording_queues[key] = Queue(maxsize=100)  # Allow up to 100 frames in buffer
+                        self.recording_stop_events[key] = Event()
                         
-                        if 'command_queue' not in self.__dict__:
-                            self.command_queue = {}
+                        # Start recorder process
+                        recorder_process = Process(
+                            target=frame_recorder_process,
+                            args=(key, video_filepath, self.recording_queues[key], 
+                                self.recording_stop_events[key], frame.shape, 25.0, True)
+                        )
+                        recorder_process.start()
+                        self.recording_processes[key] = recorder_process
+            
+            # For RGB cameras, use dedicated recording queue
+            for camera_id in self.rgb_cameras.keys():
+                key = ('RGB', camera_id)
+                
+                if self.status_values[key].value == 1:  # Only record running cameras
+                    # Determine output file name with tag
+                    file_path = os.path.join(folder_path, 'RGB', f"RGB_{camera_id}_{tag}_{timestamp}.avi")
+                    
+                    # Get a frame to determine dimensions
+                    frame = self.get_frame('RGB', camera_id)
+                    if frame is not None:
+                        # Create recording queue and stop event
+                        self.recording_queues[key] = Queue(maxsize=100)  # Allow up to 100 frames in buffer
+                        self.recording_stop_events[key] = Event()
                         
-                        if key not in self.command_queue:
-                            self.command_queue[key] = Queue()
-                        
-                        # Get a frame to determine dimensions
-                        frame = self.get_frame(camera_type, camera_id)
-                        if frame is None:
-                            continue
-                        
-                        # Determine codec and parameters based on camera type
-                        if camera_type == 'EVS':
-                            raw_filepath = os.path.join(folder_path, 'EVS', f"EVS_{camera_id}_{tag}_{timestamp}.raw")
-                            self.command_queue[key].put(('start_recording', raw_filepath))
-                            
-                            # For EVS (grayscale), use a grayscale codec
-                            fourcc = cv2.VideoWriter_fourcc(*'XVID')
-                            fps = 25.0
-                            if len(frame.shape) == 2:
-                                height, width = frame.shape
-                                writer = cv2.VideoWriter(file_path, fourcc, fps, (width, height), False)
-                            else:
-                                height, width, _ = frame.shape
-                                writer = cv2.VideoWriter(file_path, fourcc, fps, (width, height), True)
-                                
-                                
-                            self.video_writers[key] = {
-                                'writer': writer,
-                                'path': file_path,
-                                'count': 0,  # Frame counter
-                                'type': 'raw'
-                            }
-                        else:
-                            # For RGB cameras
-                            fourcc = cv2.VideoWriter_fourcc(*'XVID')
-                            fps = 30.0
-                            height, width = frame.shape[:2]
-                            writer = cv2.VideoWriter(file_path, fourcc, fps, (width, height), True)
-                        
-                            self.video_writers[key] = {
-                                'writer': writer,
-                                'path': file_path,
-                                'count': 0,  # Frame counter
-                                'type': 'video'
-                            }
+                        # Start recorder process
+                        recorder_process = Process(
+                            target=frame_recorder_process,
+                            args=(key, file_path, self.recording_queues[key], 
+                                self.recording_stop_events[key], frame.shape, 30.0, False)
+                        )
+                        recorder_process.start()
+                        self.recording_processes[key] = recorder_process
             
             # Set recording state
             self.recording = True
@@ -448,52 +1078,45 @@ class CameraManager:
         if not self.recording:
             return
         
-        # Release all video writers
-        for key, writer_info in self.video_writers.items():
-            
-            
-            writer = writer_info['writer']
-            frames = writer_info['count']
-            path = writer_info['path']
-            
-            writer.release()
-            
-            if writer_info.get("type") == "raw":
-                if key in self.command_queue:
-                    self.command_queue[key].put(('stop_recording', None))
-                    
-                path = writer_info['path']
-                print(f"Stopped raw recording to {path}")
-                
-            print(f"Saved video with {frames} frames to {path}")
+        # Stop raw recording for EVS cameras
+        for key in list(self.command_queue.keys()):
+            if key[0] == 'EVS':  # For EVS cameras
+                self.command_queue[key].put(('stop_recording', None))
         
-        self.video_writers.clear()
+        # Signal all recorder processes to stop
+        for key, stop_event in self.recording_stop_events.items():
+            stop_event.set()
+        
+        # Wait for recorder processes to finish
+        for key, process in self.recording_processes.items():
+            process.join(timeout=5.0)  # Wait up to 5 seconds
+            if process.is_alive():
+                process.terminate()
+        
+        # Clear recording resources
+        if hasattr(self, 'recording_queues'):
+            self.recording_queues.clear()
+        if hasattr(self, 'recording_processes'):
+            self.recording_processes.clear()
+        if hasattr(self, 'recording_stop_events'):
+            self.recording_stop_events.clear()
+        
         self.recording = False
         self.recording_path = ""
         print("Recording stopped")
 
     def record_frame(self, camera_type, camera_id, frame):
-        """Record a frame if recording is active"""
+        """Add frame to recording queue if recording is active"""
         if not self.recording:
             return
         
         key = (camera_type, camera_id)
-        if key in self.video_writers and frame is not None:
-            writer_info = self.video_writers[key]
-            writer = writer_info['writer']
-            
-            try:
-                # For grayscale frames, OpenCV requires correct format
-                if camera_type == 'EVS' and len(frame.shape) == 2:
-                    writer.write(frame)
-                else:
-                    writer.write(frame)
-                
-                # Update frame counter
-                writer_info['count'] += 1
-            except Exception as e:
-                print(f"Error recording frame from {camera_type} camera {camera_id}: {e}")
-    
+        if key in self.recording_queues and frame is not None:
+            # Add frame to recording queue without blocking
+            if not self.recording_queues[key].full():
+                self.recording_queues[key].put(frame.copy())  # Use copy to prevent reference issues
+        
+        
     def remove_rgb_camera(self, camera_id):
         """Remove an RGB camera"""
         key = ('RGB', camera_id)
@@ -727,6 +1350,71 @@ class CameraControlPanel(QWidget):
         self.setLayout(layout)
         self.setMaximumWidth(350)
     
+    
+    def update_evs_settings(self):
+        """Update EVS camera settings widgets"""
+        # Clear existing widgets
+        while self.evs_settings_layout.count():
+            item = self.evs_settings_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        
+        # Add widgets for each camera
+        for i in range(self.evs_camera_count):
+            camera_layout = QHBoxLayout()
+            camera_layout.addWidget(QLabel(f"Camera {i+1}:"))
+            
+            # Device path input
+            device_input = QComboBox()
+            if METAVISION_AVAILABLE:
+                device_input.addItem(f"/dev/event-camera{i}")
+                device_input.addItem(f"")  # Empty for auto-detection
+                device_input.setEditable(True)
+            else:
+                device_input.addItem("Metavision SDK not available")
+                device_input.setEnabled(False)
+            
+            camera_layout.addWidget(device_input)
+            
+            # Add settings button
+            settings_button = QPushButton("Settings")
+            settings_button.setFixedWidth(80)
+            settings_button.clicked.connect(lambda checked, camera_id=i: self.open_bias_settings(camera_id))
+            camera_layout.addWidget(settings_button)
+            
+            self.evs_settings_layout.addLayout(camera_layout)
+        
+    def open_bias_settings(self, camera_id):
+        """Open bias settings dialog for a specific camera"""
+        if not hasattr(self, 'bias_dialogs'):
+            self.bias_dialogs = {}
+        
+        # Get device information from camera manager if available
+        device_info = None
+        key = ('EVS', camera_id)
+        if hasattr(self, 'camera_manager') and key in self.camera_manager.device_info_queues:
+            # Check if device information is available
+            device_info_queue = self.camera_manager.device_info_queues[key]
+            if not device_info_queue.empty():
+                device_info = device_info_queue.get()
+        
+        # Create new dialog if it doesn't exist
+        if camera_id not in self.bias_dialogs:
+            dialog = BiasSettingsDialog(camera_id, device_info)
+            dialog.bias_changed.connect(self.forward_bias_change)
+            self.bias_dialogs[camera_id] = dialog
+        
+        # Show the dialog
+        self.bias_dialogs[camera_id].show()
+        self.bias_dialogs[camera_id].raise_()
+        self.bias_dialogs[camera_id].activateWindow()
+
+    def forward_bias_change(self, bias_name, value, camera_id):
+        """Forward bias change signal to main app"""
+        # Signal to parent to update the bias
+        if hasattr(self, 'camera_manager') and self.camera_manager is not None:
+            self.camera_manager.update_camera_bias(bias_name, value, camera_id)
+            
     def on_start_recording_clicked(self):
         """Handle start recording button click"""
         folder_path = self.folder_path_label.text()
@@ -774,32 +1462,6 @@ class CameraControlPanel(QWidget):
             # Only allow recording to start if folder is selected and cameras are running
             self.start_recording_button.setEnabled(self.is_running())
             
-    def update_evs_settings(self):
-        """Update EVS camera settings widgets"""
-        # Clear existing widgets
-        while self.evs_settings_layout.count():
-            item = self.evs_settings_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        
-        # Add widgets for each camera
-        for i in range(self.evs_camera_count):
-            camera_layout = QHBoxLayout()
-            camera_layout.addWidget(QLabel(f"Camera {i+1}:"))
-            
-            # Device path input
-            device_input = QComboBox()
-            if METAVISION_AVAILABLE:
-                device_input.addItem(f"/dev/event-camera{i}")
-                device_input.addItem(f"")  # Empty for auto-detection
-                device_input.setEditable(True)
-            else:
-                device_input.addItem("Metavision SDK not available")
-                device_input.setEnabled(False)
-            
-            camera_layout.addWidget(device_input)
-            
-            self.evs_settings_layout.addLayout(camera_layout)
     
     def update_rgb_settings(self):
         """Update RGB camera settings widgets"""
@@ -1127,6 +1789,8 @@ class CameraManagerApp(QMainWindow):
         self.control_panel.layout_changed.connect(self.on_layout_changed)
         self.control_panel.cameras_changed.connect(self.update_cameras)
         
+        self.control_panel.camera_manager = self.camera_manager
+        
         # Add scale control to the control panel
         scale_group = QGroupBox("Camera Scaling")
         scale_layout = QVBoxLayout()
@@ -1177,9 +1841,9 @@ class CameraManagerApp(QMainWindow):
         self.show_v_scrollbar.setChecked(True)
         self.show_v_scrollbar.stateChanged.connect(self.on_scrollbar_toggle)
         
-        scroll_layout.addWidget(QLabel("Scroll Speed:"))
-        scroll_layout.addWidget(self.scroll_speed_slider)
-        scroll_layout.addLayout(scroll_speed_labels)
+        # scroll_layout.addWidget(QLabel("Scroll Speed:"))
+        # scroll_layout.addWidget(self.scroll_speed_slider)
+        # scroll_layout.addLayout(scroll_speed_labels)
         scroll_layout.addWidget(self.show_h_scrollbar)
         scroll_layout.addWidget(self.show_v_scrollbar)
         
